@@ -1,130 +1,82 @@
-import numpy as np
-import random
-import json
+from time import time
 
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from keras import backend, optimizers
+from keras.layers import Activation, Bidirectional, Dense, Dropout, Embedding, Flatten, Input, Lambda, Layer, \
+    LSTM, Permute, RepeatVector, TimeDistributed
+from keras.layers.merge import multiply, concatenate
+from keras.models import Model
 
-from nltk_utils import bag_of_words, tokenize, stem
-from model import NeuralNet
-
-with open('intents.json', 'r') as f:
-    intents = json.load(f)
-
-all_words = []
-tags = []
-xy = []
-# loop through each sentence in our intents patterns
-for intent in intents['intents']:
-    tag = intent['tag']
-    # add to tag list
-    tags.append(tag)
-    for pattern in intent['patterns']:
-        # tokenize each word in the sentence
-        w = tokenize(pattern)
-        # add to our words list
-        all_words.extend(w)
-        # add to xy pair
-        xy.append((w, tag))
-
-# stem and lower each word
-ignore_words = ['?', '.', '!']
-all_words = [stem(w) for w in all_words if w not in ignore_words]
-# remove duplicates and sort
-all_words = sorted(set(all_words))
-tags = sorted(set(tags))
-
-print(len(xy), "patterns")
-print(len(tags), "tags:", tags)
-print(len(all_words), "unique stemmed words:", all_words)
-
-# create training data
-X_train = []
-y_train = []
-for (pattern_sentence, tag) in xy:
-    # X: bag of words for each pattern_sentence
-    bag = bag_of_words(pattern_sentence, all_words)
-    X_train.append(bag)
-    # y: PyTorch CrossEntropyLoss needs only class labels, not one-hot
-    label = tags.index(tag)
-    y_train.append(label)
-
-X_train = np.array(X_train)
-y_train = np.array(y_train)
-
-# Hyper-parameters 
-num_epochs = 1000
-batch_size = 8
-learning_rate = 0.001
-input_size = len(X_train[0])
-hidden_size = 8
-output_size = len(tags)
-print(input_size, output_size)
+from params import BATCH_SIZE, EMBEDDING_DIM, EPOCHS, HIDDEN_LAYERS, MAX_SEQ_LENGTH
 
 
-class ChatDataset(Dataset):
+def train(x_train, y_train, x_validation, y_validation, embeddings):
+    left_input = Input(shape=(MAX_SEQ_LENGTH,), dtype="float32")
+    right_input = Input(shape=(MAX_SEQ_LENGTH,), dtype="float32")
+    left_sen_representation = _shared_model(left_input, embeddings)
+    right_sen_representation = _shared_model(right_input, embeddings)
 
-    def __init__(self):
-        self.n_samples = len(X_train)
-        self.x_data = X_train
-        self.y_data = y_train
+    man_distance = ManDist()(
+        [left_sen_representation, right_sen_representation])
+    sen_representation = concatenate(
+        [left_sen_representation, right_sen_representation, man_distance])
+    similarity = Dense(1, activation="sigmoid")(
+        Dense(2)(Dense(4)(Dense(16)(sen_representation))))
+    model = Model(inputs=[left_input, right_input], outputs=[similarity])
 
-    # support indexing such that dataset[i] can be used to get i-th sample
-    def __getitem__(self, index):
-        return self.x_data[index], self.y_data[index]
+    model.compile(loss="mean_squared_error",
+                  optimizer=optimizers.Adam(), metrics=["accuracy"])
+    model.summary()
 
-    # we can call len(dataset) to return the size
-    def __len__(self):
-        return self.n_samples
+    training_start_time = time()
+    malstm_trained = model.fit([x_train["left"], x_train["right"]],
+                               y_train,
+                               batch_size=BATCH_SIZE,
+                               epochs=EPOCHS,
+                               validation_data=([x_validation["left"], x_validation["right"]], y_validation))
+    training_end_time = time()
+    print("Training time finished.\n%d epochs in %12.2f" %
+          (EPOCHS, training_end_time - training_start_time))
+
+    return model
 
 
-dataset = ChatDataset()
-train_loader = DataLoader(dataset=dataset,
-                          batch_size=batch_size,
-                          shuffle=True,
-                          num_workers=0)
+class ManDist(Layer):
+    def __init__(self, **kwargs):
+        self.result = None
+        super(ManDist, self).__init__(**kwargs)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def build(self, input_shape):
+        super(ManDist, self).build(input_shape)
 
-model = NeuralNet(input_size, hidden_size, output_size).to(device)
+    def call(self, x, **kwargs):
+        self.result = backend.exp(-backend.sum(
+            backend.abs(x[0] - x[1]), axis=1, keepdims=True))
+        return self.result
 
-# Loss and optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    def compute_output_shape(self, input_shape):
+        return backend.int_shape(self.result)
 
-# Train the model
-for epoch in range(num_epochs):
-    for (words, labels) in train_loader:
-        words = words.to(device)
-        labels = labels.to(dtype=torch.long).to(device)
 
-        # Forward pass
-        outputs = model(words)
-        # if y would be one-hot, we must apply
-        # labels = torch.max(labels, 1)[1]
-        loss = criterion(outputs, labels)
+def _shared_model(input, embeddings):
+    embedded = Embedding(len(embeddings), EMBEDDING_DIM, weights=[embeddings], input_shape=(MAX_SEQ_LENGTH,),
+                         trainable=False)(input)
 
-        # Backward and optimize
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    activations = Bidirectional(
+        LSTM(HIDDEN_LAYERS, return_sequences=True), merge_mode="concat")(embedded)
+    activations = Bidirectional(
+        LSTM(HIDDEN_LAYERS, return_sequences=True), merge_mode="concat")(activations)
 
-    if (epoch + 1) % 100 == 0:
-        print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}')
+    activations = Dropout(0.5)(activations)
 
-print(f'final loss: {loss.item():.4f}')
+    attention = TimeDistributed(Dense(1, activation="tanh"))(activations)
+    attention = Flatten()(attention)
+    attention = Activation("softmax")(attention)
+    attention = RepeatVector(HIDDEN_LAYERS * 2)(attention)
+    attention = Permute([2, 1])(attention)
+    sent_representation = multiply([activations, attention])
+    sent_representation = Lambda(
+        lambda xin: backend.sum(xin, axis=1))(sent_representation)
 
-data = {
-    "model_state": model.state_dict(),
-    "input_size": input_size,
-    "hidden_size": hidden_size,
-    "output_size": output_size,
-    "all_words": all_words,
-    "tags": tags
-}
+    sent_representation = Dropout(0.1)(sent_representation)
 
-FILE = "data.pth"
-torch.save(data, FILE)
-
-print(f'training complete. file saved to {FILE}')
+    return sent_representation
