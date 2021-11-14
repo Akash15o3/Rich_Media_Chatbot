@@ -16,6 +16,7 @@ PORT = 22370
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ["train", "serve"]:
+        print("hello")
         sys.exit("Expect argument [train|serve]")
 
     if sys.argv[1].lower() == "train":
